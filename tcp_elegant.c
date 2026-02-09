@@ -29,10 +29,6 @@ static int inv_beta_base __read_mostly = 88U;
 
 struct elegant {
     u64 sum_rtt;               /* Sum of RTTs in last round */
-    u64 ratio;                 /* Cached rtt_max / rtt_curr ratio */
-    u64 next_rtt_delivered;    /* Next RTT boundary (matches tp->delivered) */
-    u64 bw_hi[2];              /* Max recent measured BW samples) */
-
     u32 cnt_rtt;               /* Samples in this RTT */
     u32 round_base_rtt;        /* Min RTT in current round */
     u32 round_rtt_max;         /* Max RTT in current round */
@@ -41,8 +37,11 @@ struct elegant {
     u32 rtt_curr;              /* Current avg RTT */
     u32 beta;                  /* Multiplicative decrease factor */
     u32 inv_beta;              /* Inverse beta for pacing gain */
+	u32 ratio;                 /* Cached rtt_max / rtt_curr ratio */
     u32 round;                 /* Round counter */
-    u32 reset_time;            /* Time for BW filter reset */
+	u32 next_rtt_delivered;    /* Next RTT boundary (matches tp->delivered) */
+    u32 bw_hi[2];              /* Max recent measured BW samples) */
+	u32 reset_time;            /* Time for BW filter reset */
 };
 
 static inline u32 beta_scale(const struct elegant *ca, u32 value)
@@ -118,7 +117,7 @@ static u32 bbr_max_bw(const struct sock *sk)
 	return max(ca->bw_hi[0], ca->bw_hi[1]);
 }
 
-static void bbr_take_max_bw_sample(struct sock *sk, u64 bw)
+static void bbr_take_max_bw_sample(struct sock *sk, u32 bw)
 {
 	struct elegant *ca = inet_csk_ca(sk);
 	ca->bw_hi[1] = max(bw, ca->bw_hi[1]);
@@ -139,11 +138,6 @@ static void elegant_init(struct sock *sk)
     struct elegant *ca = inet_csk_ca(sk);
 
     ca->sum_rtt = 0;
-    ca->ratio = 0;
-    ca->next_rtt_delivered = tp->delivered;
-    ca->bw_hi[0] = 0;
-    ca->bw_hi[1] = 0;
-
     ca->cnt_rtt = 0;
     ca->round_base_rtt = UINT_MAX;
     ca->round_rtt_max = 0;
@@ -152,8 +146,12 @@ static void elegant_init(struct sock *sk)
     ca->rtt_curr = 0;
     ca->beta = BETA_MIN;
     ca->inv_beta = inv_beta_init;
+	ca->ratio = 0;
     ca->round = 0;
-    ca->reset_time = tcp_jiffies32;
+    ca->next_rtt_delivered = tp->delivered;
+    ca->bw_hi[0] = 0;
+    ca->bw_hi[1] = 0;
+	ca->reset_time = tcp_jiffies32;
 
     bbr_init_pacing_rate_from_rtt(sk);
 }
@@ -264,7 +262,7 @@ static void elegant_cong_avoid(struct sock *sk, struct elegant *ca, const struct
 		tcp_slow_start(tp, rs->acked_sacked);
 	} else {
 		u32 wwf;
-		u64 ratio = ca->ratio;
+		u32 ratio = ca->ratio;
 		if (ratio == 0) {
 			ratio = ((u64)ca->rtt_max << ELEGANT_UNIT_SQ_SHIFT);
 			ratio = DIV_ROUND_UP_ULL(ratio, ca->rtt_curr);
