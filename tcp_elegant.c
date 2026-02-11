@@ -21,7 +21,11 @@
 #define BW_UNIT (1 << BW_SCALE)
 
 #define BBR_SCALE 8	/* scaling factor for fractions in BBR (e.g. gains) */
-#define BBR_UNIT (1 << BBR_SCALE)
+#define BBR_BW_SHIFT (BBR_SCALE + BW_SCALE)  /* 32 */
+
+#define RECIP_7      9363u
+#define RECIP_10     6554u   /* Q16 reciprocal of 10 */
+#define RECIP_SHIFT  16
 
 static int win_thresh __read_mostly = 15U;
 static int inv_beta_init __read_mostly = 80U;
@@ -57,20 +61,17 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, const struct elegant *ca, u64
 {
 	unsigned int mss = tcp_sk(sk)->mss_cache;
 
-	rate *= mss;
-	rate = (rate * (ca->inv_beta)) >> BETA_SHIFT;
-	rate >>= BBR_SCALE;
-	rate *= USEC_PER_SEC / 100 * (100 - margin);
-	rate >>= BW_SCALE;
-	rate = max(rate, 1ULL);
-	return rate;
+    rate *= mss;
+    rate = (rate * (ca->inv_beta)) >> BETA_SHIFT;
+    rate >>= BBR_BW_SHIFT;
+    rate = max(rate, 1ULL);
+    return rate;
 }
 
 static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw)
 {
 	struct elegant *ca = inet_csk_ca(sk);
-	u64 rate = bw;
-	rate = bbr_rate_bytes_per_sec(sk, ca, rate, 1);
+	u64 rate = bbr_rate_bytes_per_sec(sk, ca, bw, 1);
 	rate = min(rate, (u64)READ_ONCE(sk->sk_max_pacing_rate));
 	return rate;
 }
@@ -97,7 +98,7 @@ static void bbr_set_pacing_rate(struct sock *sk, u64 bw)
 	struct elegant *ca = inet_csk_ca(sk);
 	u64 rate = bbr_bw_to_pacing_rate(sk, bw);
 
-	if (unlikely(ca->cnt_rtt > 0 && tp->srtt_us))
+	if (unlikely(!ca->cnt_rtt && tp->srtt_us))
 		bbr_init_pacing_rate_from_rtt(sk);
 	rate = max(rate, 120ULL);
 	if (rate > READ_ONCE(sk->sk_pacing_rate))
@@ -184,30 +185,19 @@ static inline u32 avg_delay(struct tcp_sock *tp, struct elegant *ca)
 
 static u32 beta(u32 da, u32 dm)
 {
-	u32 d2, d3;
+	u32 d2, d3, num;
 
-	d2 = dm / 10;
-	if (da <= d2)
-		return BETA_MIN;
+    d2 = (dm * RECIP_10) >> RECIP_SHIFT; /* lower threshold */
+    if (da <= d2)
+        return BETA_MIN;
 
-	d3 = d2 << 3;
-	if (da >= d3)
-		return BETA_MAX;
+	d3 = (dm * (RECIP_10 << 3)) >> RECIP_SHIFT; /* upper threshold = 8 * d2 */
+    if (da >= d3)
+        return BETA_MAX;
 
-	/*
-	 * Based on:
-	 *
-	 *       bmin d3 - bmax d2
-	 * k3 = -------------------
-	 *         d3 - d2
-	 *
-	 *       bmax - bmin
-	 * k4 = -------------
-	 *         d3 - d2
-	 *
-	 * b = k3 + k4 da
-	 */
-	return (BETA_MIN * d3 - BETA_MAX * d2 + (BETA_MAX - BETA_MIN) * da) / (d3 - d2);
+    num = BETA_MIN * d3 - BETA_MAX * d2 + (BETA_MAX - BETA_MIN) * da;
+
+    return (num * RECIP_7) >> RECIP_SHIFT;
 }
 
 static inline void rtt_reset(struct tcp_sock *tp, struct elegant *ca)
@@ -234,8 +224,9 @@ static void update_params(struct sock *sk)
 	struct elegant *ca = inet_csk_ca(sk);
 
 	u32 da = avg_delay(tp, ca);
-    u64 thresh_arg = ((u64)bbr_max_bw(sk) * da) / tp->mss_cache;
-    u32 thresh = max_t(u32, win_thresh, 2 * (thresh_arg ? ilog2(thresh_arg) : 0));
+	u32 recip_mss = (1u << RECIP_SHIFT) / tp->mss_cache;
+	u64 thresh_arg = ((u64)bbr_max_bw(sk) * da * recip_mss) >> RECIP_SHIFT;
+	u32 thresh = max_t(u32, win_thresh, 2 * (thresh_arg ? fls64(thresh_arg) - 1 : 0));
 
     if (tp->snd_cwnd < thresh) {
         ca->beta = BETA_MIN;
@@ -248,6 +239,28 @@ static void update_params(struct sock *sk)
 	}
 
 	rtt_reset(tp, ca);
+}
+
+static inline u64 fast_sqrt(u64 x)
+{
+	u64 result = 0;
+    u64 guess = 1ULL << ((fls64(x) - 1) >> 1);
+    u64 bit = guess * guess;
+    if (x < 2)
+        return x;
+    while (bit > x)
+        bit >>= 2;
+    while (bit) {
+        if (x >= result + bit) {
+            x -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+
+    return result;
 }
 
 static void elegant_cong_avoid(struct sock *sk, struct elegant *ca, const struct rate_sample *rs)
@@ -263,12 +276,12 @@ static void elegant_cong_avoid(struct sock *sk, struct elegant *ca, const struct
 	} else {
 		u32 wwf;
 		u32 ratio = ca->ratio;
-		if (ratio == 0) {
-			ratio = ((u64)ca->rtt_max << ELEGANT_UNIT_SQ_SHIFT);
+		if (unlikely(ratio == 0)) {
+			ratio = ca->rtt_max << ELEGANT_UNIT_SQ_SHIFT;
 			ratio = DIV_ROUND_UP_ULL(ratio, ca->rtt_curr);
-			ca->ratio = ratio;
+			ca->ratio = fast_sqrt(ratio+1);
 		}
-		wwf = int_sqrt64(tp->snd_cwnd * ratio) >> ELEGANT_SCALE;
+		wwf = (fast_sqrt(tp->snd_cwnd) * ratio) >> ELEGANT_SCALE;
 		tcp_cong_avoid_ai(tp, tp->snd_cwnd, wwf);
 	}
 }
@@ -327,6 +340,7 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 	tcp_elegant_round(sk, ca, rs);
 
 	if (rs->interval_us > 0 && rs->acked_sacked) {
+		elegant_cong_avoid(sk, ca, rs);
 		bw = bbr_calculate_bw_sample(sk, rs);
 		if (unlikely(bw > bbr_max_bw(sk))) {
 			bbr_take_max_bw_sample(sk, bw);
@@ -336,12 +350,11 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 		}
 		filter_expired = after(tcp_jiffies32, ca->reset_time + 10 * HZ);
 		if (filter_expired || (ca->beta > 24 && ca->round >= 12)) {
-			bbr_advance_max_bw_filter(sk);
 			ca->round = 0;
-			ca->reset_time = tcp_jiffies32;
+			bbr_advance_max_bw_filter(sk);
 			bbr_set_pacing_rate(sk, bbr_max_bw(sk));
+			ca->reset_time = tcp_jiffies32;
 		}
-		elegant_cong_avoid(sk, ca, rs);
 	}
 }
 
