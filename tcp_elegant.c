@@ -34,6 +34,7 @@ static int inv_beta_base __read_mostly = 88U;
 struct elegant {
     u64 sum_rtt;               /* Sum of RTTs in last round */
     u32 cnt_rtt;               /* Samples in this RTT */
+	u32 last_rtt;
     u32 round_base_rtt;        /* Min RTT in current round */
     u32 round_rtt_max;         /* Max RTT in current round */
     u32 base_rtt;              /* Min of all RTTs */
@@ -140,6 +141,7 @@ static void elegant_init(struct sock *sk)
 
     ca->sum_rtt = 0;
     ca->cnt_rtt = 0;
+	ca->last_rtt = 0;
     ca->round_base_rtt = UINT_MAX;
     ca->round_rtt_max = 0;
     ca->base_rtt = UINT_MAX;
@@ -298,6 +300,7 @@ static void elegant_update_rtt(struct elegant *ca, const struct rate_sample *rs)
 
 	ca->sum_rtt += rtt_us;
 	ca->cnt_rtt++;
+	ca->last_rtt = rtt_us;
 
 	/* keep track of minimum RTT seen so far */
 	if (rtt_us < ca->round_base_rtt)
@@ -360,13 +363,15 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 
 static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
 
 	if (new_state == TCP_CA_Loss) {
-		rtt_reset(tp, ca);
-		ca->round_base_rtt = UINT_MAX;
-		ca->round_rtt_max = 0;
+		if (ca->cnt_rtt > 0 && ca->last_rtt > 0) {
+			ca->sum_rtt -= ca->last_rtt;
+			ca->cnt_rtt--;
+			ca->round_base_rtt = UINT_MAX;
+			ca->round_rtt_max = 0;
+		}
 	}
 }
 
@@ -401,5 +406,6 @@ static void __exit elegant_unregister(void)
 module_init(elegant_register);
 module_exit(elegant_unregister);
 
+MODULE_AUTHOR("benhoklfai@gmail.com");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Elegant TCP");
