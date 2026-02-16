@@ -1,7 +1,6 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
-#include <asm/div64.h>
 #include <linux/bitops.h>
 #include <linux/math64.h>
 #include <net/tcp.h>
@@ -58,12 +57,13 @@ static inline u32 beta_scale(const struct elegant *ca, u32 value)
  * The order here is chosen carefully to avoid overflow of u64. This should
  * work for input rates of up to 2.9Tbit/sec and gain of 2.89x.
  */
-static u64 bbr_rate_bytes_per_sec(struct sock *sk, const struct elegant *ca, u64 rate, int margin)
+static u64 bbr_rate_bytes_per_sec(struct sock *sk, const struct elegant *ca, u64 rate)
 {
 	unsigned int mss = tcp_sk(sk)->mss_cache;
 
     rate *= mss;
     rate = (rate * (ca->inv_beta)) >> BETA_SHIFT;
+	rate *= USEC_PER_SEC / 100 * 99;
     rate >>= BBR_BW_SHIFT;
     rate = max(rate, 1ULL);
     return rate;
@@ -72,7 +72,7 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, const struct elegant *ca, u64
 static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw)
 {
 	struct elegant *ca = inet_csk_ca(sk);
-	u64 rate = bbr_rate_bytes_per_sec(sk, ca, bw, 1);
+	u64 rate = bbr_rate_bytes_per_sec(sk, ca, bw);
 	rate = min(rate, (u64)READ_ONCE(sk->sk_max_pacing_rate));
 	return rate;
 }
