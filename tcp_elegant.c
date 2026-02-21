@@ -63,7 +63,7 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, const struct elegant *ca, u64
 
     rate *= mss;
     rate = (rate * (ca->inv_beta)) >> BETA_SHIFT;
-	rate *= USEC_PER_SEC / 100 * 99;
+	rate *= USEC_PER_SEC;
     rate >>= BBR_BW_SHIFT;
     rate = max(rate, 1ULL);
     return rate;
@@ -191,11 +191,11 @@ static u32 beta(u32 da, u32 dm)
 
     d2 = (dm * RECIP_10) >> RECIP_SHIFT; /* lower threshold */
     if (da <= d2)
-        return BETA_MIN;
+		return BETA_MIN;
 
 	d3 = (dm * (RECIP_10 << 3)) >> RECIP_SHIFT; /* upper threshold = 8 * d2 */
     if (da >= d3)
-        return BETA_MAX;
+		return BETA_MAX;
 
     num = BETA_MIN * d3 - BETA_MAX * d2 + (BETA_MAX - BETA_MIN) * da;
 
@@ -284,6 +284,7 @@ static void elegant_cong_avoid(struct sock *sk, struct elegant *ca, const struct
 			ca->ratio = fast_sqrt(ratio+1);
 		}
 		wwf = (fast_sqrt(tp->snd_cwnd) * ratio) >> ELEGANT_SCALE;
+		wwf = (wwf * (ca->inv_beta)) >> BETA_SHIFT;
 		tcp_cong_avoid_ai(tp, tp->snd_cwnd, wwf);
 	}
 }
@@ -361,8 +362,18 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 	}
 }
 
+static u32 tcp_elegant_bw_rttmin(const struct sock *sk)
+{
+    const struct tcp_sock *tp = tcp_sk(sk);
+    const struct elegant *ca = inet_csk_ca(sk);
+    u32 bw_est = bbr_max_bw(sk);
+    u32 rtt_min = ca->base_rtt ? ca->base_rtt : (tp->srtt_us >> 3);
+    return max_t(u32, (bw_est * rtt_min) / tp->mss_cache, 2);
+}
+
 static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
 
 	if (new_state == TCP_CA_Loss) {
@@ -372,6 +383,7 @@ static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
 			ca->round_base_rtt = UINT_MAX;
 			ca->round_rtt_max = 0;
 		}
+        tp->snd_ssthresh = tcp_elegant_bw_rttmin(sk);
 	}
 }
 
