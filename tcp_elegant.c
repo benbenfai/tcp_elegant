@@ -284,7 +284,8 @@ static void elegant_cong_avoid(struct sock *sk, struct elegant *ca, const struct
 			ca->ratio = fast_sqrt(ratio+1);
 		}
 		wwf = (fast_sqrt(tp->snd_cwnd) * ratio) >> ELEGANT_SCALE;
-		wwf = (wwf * (ca->inv_beta)) >> BETA_SHIFT;
+		if (ca->beta < 24)
+			wwf = (wwf * (ca->inv_beta)) >> BETA_SHIFT;
 		tcp_cong_avoid_ai(tp, tp->snd_cwnd, wwf);
 	}
 }
