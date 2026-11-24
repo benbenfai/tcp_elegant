@@ -331,9 +331,11 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 
 	if (!elegant_recovery_cwnd(sk, rs)) {
 		elegant_cong_avoid(sk, rs);
-		cap = elegant_cwnd_cap(sk);
-		if (cap && cap < tcp_snd_cwnd(tp))
-			tcp_snd_cwnd_set(tp, cap);
+		if (tcp_is_cwnd_limited(sk)) {
+			cap = elegant_cwnd_cap(sk);
+			if (cap && cap < tcp_snd_cwnd(tp))
+				tcp_snd_cwnd_set(tp, cap);
+		}
 	}
 
 	elegant_set_pacing_rate(sk);
