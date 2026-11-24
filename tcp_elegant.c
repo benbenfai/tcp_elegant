@@ -1,81 +1,54 @@
+#include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/kernel.h>
+#include <linux/skbuff.h>
+#include <linux/bitops.h>
 #include <linux/math64.h>
 #include <linux/version.h>
 #include <net/tcp.h>
 
-#define BETA_SHIFT		6
-#define BETA_SCALE		(1U << BETA_SHIFT)
-#define BETA_MIN		(BETA_SCALE / 8)
-#define BETA_MAX		(BETA_SCALE / 2)
-#define BETA_BASE		BETA_MAX
-#define GAIN_UNITY_BETA		24
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+#define tcp_snd_cwnd(tp)		((tp)->snd_cwnd)
+#define tcp_snd_cwnd_set(tp, val)	((tp)->snd_cwnd = (val))
+#endif
+
+#define ELEGANT_MD_SCALE	3
 
 #define ELEGANT_SCALE		3
-#define ELEGANT_UNIT		(1U << ELEGANT_SCALE)
-#define ELEGANT_RATIO_MAX	64
+#define ELEGANT_UNIT		(1 << ELEGANT_SCALE)
+#define ELEGANT_UNIT_SQ_SHIFT	(2 * ELEGANT_SCALE)
+#define ELEGANT_RATIO_MAX	(8 * ELEGANT_UNIT)
+
+#define BW_SCALE	24
+#define BW_UNIT		(1 << BW_SCALE)
+
+#define PACING_SS_RATIO	200U
+#define PACING_CA_RATIO	120U
 
 #define FILTER_RESET_JIFFIES	(10 * HZ)
 #define FILTER_ROUND_THRESH	12
 
-static int win_thresh __read_mostly = 15;
-module_param(win_thresh, int, 0444);
-MODULE_PARM_DESC(win_thresh, "packets in flight below which delay is ignored");
-
-static int inv_beta_init __read_mostly = 80;
-module_param(inv_beta_init, int, 0444);
-MODULE_PARM_DESC(inv_beta_init, "initial Q6 increase gain");
-
-static int inv_beta_base __read_mostly = 88;
-module_param(inv_beta_base, int, 0444);
-MODULE_PARM_DESC(inv_beta_base, "Q6 increase gain cap");
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0)
-#define tcp_snd_cwnd(tp)	((tp)->snd_cwnd)
-#endif
+static int cwnd_gain __read_mostly = 2 * ELEGANT_UNIT;
+module_param(cwnd_gain, int, 0644);
+MODULE_PARM_DESC(cwnd_gain, "Q3 inflight cap as a multiple of the BDP estimate");
 
 struct elegant {
-	u64 sum_rtt;
-	u32 cnt_rtt;
-	u32 round_rtt_min;
-	u32 round_rtt_max;
-	u32 rtt_lo[2];
 	u32 rtt_hi[2];
+	u32 bw_hi[2];
 	u32 rtt_curr;
-	u32 beta;
-	u32 inv_beta;
 	u32 ratio;
 	u32 round;
-	u32 end_seq;
+	u32 next_rtt_delivered;
+	u32 prior_cwnd;
 	u32 filter_stamp;
+	u8  prev_ca_state:3,
+	    packet_conservation:1;
 };
 
-static u32 fast_sqrt(u64 x)
+static u32 elegant_min_rtt(const struct sock *sk)
 {
-	u64 bit = 1ULL << 62;
-	u64 res = 0;
+	u32 m = tcp_min_rtt(tcp_sk(sk));
 
-	while (bit > x)
-		bit >>= 2;
-	while (bit) {
-		if (x >= res + bit) {
-			x -= res + bit;
-			res = (res >> 1) + bit;
-		} else {
-			res >>= 1;
-		}
-		bit >>= 2;
-	}
-	return (u32)res;
-}
-
-static u32 elegant_min_rtt(const struct elegant *ca)
-{
-	if (!ca->rtt_lo[0])
-		return ca->rtt_lo[1];
-	if (!ca->rtt_lo[1])
-		return ca->rtt_lo[0];
-	return min(ca->rtt_lo[0], ca->rtt_lo[1]);
+	return m == ~0U ? 0 : m;
 }
 
 static u32 elegant_max_rtt(const struct elegant *ca)
@@ -83,64 +56,11 @@ static u32 elegant_max_rtt(const struct elegant *ca)
 	return max(ca->rtt_hi[0], ca->rtt_hi[1]);
 }
 
-static u32 elegant_avg_delay(const struct elegant *ca)
+static u32 elegant_max_bw(const struct sock *sk)
 {
-	u32 base = elegant_min_rtt(ca);
-
-	return ca->rtt_curr > base ? ca->rtt_curr - base : 0;
-}
-
-static u32 elegant_max_delay(const struct elegant *ca)
-{
-	u32 base = elegant_min_rtt(ca);
-	u32 peak = elegant_max_rtt(ca);
-
-	return peak > base ? peak - base : 0;
-}
-
-static u32 elegant_beta(u32 da, u32 dm)
-{
-	u64 d2, d3, num;
-
-	d2 = dm / 10;
-	if (da <= d2)
-		return BETA_MIN;
-
-	d3 = ((u64)dm * 8) / 10;
-	if (da >= d3 || d3 <= d2)
-		return BETA_MAX;
-
-	num = BETA_MIN * d3 + (u64)(BETA_MAX - BETA_MIN) * da;
-	if (num <= (u64)BETA_MAX * d2)
-		return BETA_MIN;
-	num -= (u64)BETA_MAX * d2;
-	return clamp_t(u32, div64_u64(num, d3 - d2), BETA_MIN, BETA_MAX);
-}
-
-static u32 elegant_cut(const struct elegant *ca, u32 cwnd)
-{
-	return cwnd - (u32)(((u64)cwnd * ca->beta) >> BETA_SHIFT);
-}
-
-static u32 elegant_bdp(const struct sock *sk)
-{
-	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct elegant *ca = inet_csk_ca(sk);
-	u32 cwnd = tcp_snd_cwnd(tp);
-	u32 base = elegant_min_rtt(ca);
-	u32 rtt = ca->rtt_curr ? ca->rtt_curr : (tp->srtt_us >> 3);
 
-	if (!base || !rtt || base >= rtt)
-		return cwnd;
-	return max_t(u32, div_u64((u64)cwnd * base, rtt), 2U);
-}
-
-static void elegant_round_reset(struct elegant *ca)
-{
-	ca->sum_rtt = 0;
-	ca->cnt_rtt = 0;
-	ca->round_rtt_min = UINT_MAX;
-	ca->round_rtt_max = 0;
+	return max(ca->bw_hi[0], ca->bw_hi[1]);
 }
 
 static void elegant_advance_filters(struct sock *sk)
@@ -149,9 +69,9 @@ static void elegant_advance_filters(struct sock *sk)
 
 	ca->filter_stamp = tcp_jiffies32;
 	ca->round = 0;
-	if (ca->rtt_lo[1]) {
-		ca->rtt_lo[0] = ca->rtt_lo[1];
-		ca->rtt_lo[1] = 0;
+	if (ca->bw_hi[1]) {
+		ca->bw_hi[0] = ca->bw_hi[1];
+		ca->bw_hi[1] = 0;
 	}
 	if (ca->rtt_hi[1]) {
 		ca->rtt_hi[0] = ca->rtt_hi[1];
@@ -159,181 +79,314 @@ static void elegant_advance_filters(struct sock *sk)
 	}
 }
 
-static void elegant_update_params(struct sock *sk)
+static u32 elegant_avg_delay(const struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct elegant *ca = inet_csk_ca(sk);
-	u32 da = elegant_avg_delay(ca);
-	u32 dm = elegant_max_delay(ca);
-	u32 rtt = ca->rtt_curr ? ca->rtt_curr : max(tp->srtt_us >> 3, 1U);
+	u32 base = elegant_min_rtt(sk);
+	u32 srtt = tcp_sk(sk)->srtt_us >> 3;
+
+	if (!base || srtt <= base)
+		return 0;
+	return srtt - base;
+}
+
+static u32 elegant_max_delay(const struct sock *sk)
+{
+	const struct elegant *ca = inet_csk_ca(sk);
+	u32 base = elegant_min_rtt(sk);
 	u32 peak = elegant_max_rtt(ca);
-	u64 queued = div_u64((u64)tcp_snd_cwnd(tp) * da, rtt);
-	u32 thresh = max_t(u32, win_thresh,
-			   queued ? 2 * (fls64(queued) - 1) : 0);
 
-	if (!ca->cnt_rtt || queued < thresh || !dm) {
-		ca->beta = BETA_BASE;
-	} else {
-		ca->beta = elegant_beta(da, dm);
-	}
-
-	if (ca->beta <= BETA_MIN)
-		ca->inv_beta = min_t(u32, inv_beta_base, inv_beta_init);
-	else
-		ca->inv_beta = clamp_t(u32, BETA_SCALE + BETA_MAX - ca->beta,
-				       BETA_SCALE, (u32)inv_beta_base);
-
-	if (!rtt || peak <= rtt) {
-		ca->ratio = ELEGANT_UNIT;
-	} else {
-		u64 q = div_u64((u64)peak * ELEGANT_UNIT * ELEGANT_UNIT, rtt);
-
-		ca->ratio = clamp_t(u32, fast_sqrt(q), ELEGANT_UNIT,
-				    ELEGANT_RATIO_MAX * ELEGANT_UNIT);
-	}
+	if (!base || peak <= base)
+		return 0;
+	return peak - base;
 }
 
-static void elegant_round(struct sock *sk)
+static bool elegant_delay_stale(const struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct elegant *ca = inet_csk_ca(sk);
+	u32 dm = elegant_max_delay(sk);
 
-	ca->end_seq = tp->snd_nxt;
-	ca->round++;
-
-	if (ca->round_rtt_min != UINT_MAX) {
-		ca->rtt_lo[1] = ca->rtt_lo[1] ?
-			min(ca->rtt_lo[1], ca->round_rtt_min) :
-			ca->round_rtt_min;
-		ca->rtt_hi[1] = max(ca->rtt_hi[1], ca->round_rtt_max);
-	}
-
-	if (ca->cnt_rtt) {
-		u64 avg = ca->sum_rtt;
-
-		do_div(avg, ca->cnt_rtt);
-		ca->rtt_curr = max_t(u32, avg, 1U);
-	} else if (tp->srtt_us) {
-		ca->rtt_curr = max(tp->srtt_us >> 3, 1U);
-	}
-
-	elegant_update_params(sk);
-	elegant_round_reset(ca);
-
-	if (after(tcp_jiffies32, ca->filter_stamp + FILTER_RESET_JIFFIES) ||
-	    (ca->beta > GAIN_UNITY_BETA && ca->round >= FILTER_ROUND_THRESH))
-		elegant_advance_filters(sk);
+	return dm && elegant_avg_delay(sk) >= dm - dm / 5;
 }
 
-static void tcp_elegant_acked(struct sock *sk, const struct ack_sample *sample)
+static u32 elegant_bw_sample(const struct rate_sample *rs)
 {
-	struct elegant *ca = inet_csk_ca(sk);
-	u32 rtt_us;
+	u64 bw;
 
-	if (sample->rtt_us < 0)
+	if (rs->interval_us <= 0 || rs->delivered <= 0)
+		return 0;
+	bw = DIV_ROUND_UP_ULL((u64)rs->delivered * BW_UNIT, rs->interval_us);
+	return min_t(u64, bw, U32_MAX);
+}
+
+static u32 elegant_bdp(const struct sock *sk)
+{
+	u32 bw = elegant_max_bw(sk);
+	u32 rtt = elegant_min_rtt(sk);
+	u64 bdp;
+
+	if (!bw || !rtt)
+		return 0;
+	bdp = ((u64)bw * rtt) >> BW_SCALE;
+	return (u32)clamp_t(u64, bdp, 2, U32_MAX);
+}
+
+static u32 elegant_cwnd_cap(const struct sock *sk)
+{
+	u32 bdp = elegant_bdp(sk);
+	u64 cap;
+
+	if (!bdp)
+		return 0;
+	cap = ((u64)bdp * cwnd_gain) >> ELEGANT_SCALE;
+	return (u32)clamp_t(u64, cap, 2, tcp_sk(sk)->snd_cwnd_clamp);
+}
+
+static void elegant_set_pacing_rate(struct sock *sk)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+	u64 rate;
+
+	if (unlikely(!tp->srtt_us || !tp->mss_cache))
 		return;
 
-	rtt_us = max_t(u32, sample->rtt_us, 1U);
-	ca->sum_rtt += rtt_us;
-	ca->cnt_rtt++;
-	if (rtt_us < ca->round_rtt_min)
-		ca->round_rtt_min = rtt_us;
-	if (rtt_us > ca->round_rtt_max)
-		ca->round_rtt_max = rtt_us;
+	rate = (u64)tp->mss_cache * ((USEC_PER_SEC / 100) << 3);
+	rate *= tcp_snd_cwnd(tp) < tp->snd_ssthresh / 2 ?
+		PACING_SS_RATIO : PACING_CA_RATIO;
+	rate *= max(tcp_snd_cwnd(tp), tp->packets_out);
+	do_div(rate, tp->srtt_us);
+
+	WRITE_ONCE(sk->sk_pacing_rate,
+		   min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate)));
 }
 
-static void tcp_elegant_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+static u64 fast_sqrt(u64 x)
+{
+	u64 result = 0;
+	u64 bit;
+
+	if (x < 2)
+		return x;
+	bit = 1ULL << ((fls64(x) - 1) & ~1U);
+	while (bit) {
+		if (x >= result + bit) {
+			x -= result + bit;
+			result = (result >> 1) + bit;
+		} else {
+			result >>= 1;
+		}
+		bit >>= 2;
+	}
+	return result;
+}
+
+static u32 elegant_wwf_ratio(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
+	u32 rtt_curr = ca->rtt_curr ? ca->rtt_curr : (tp->srtt_us >> 3);
+	u32 rtt_max = elegant_max_rtt(ca);
+	u32 ratio;
+	u64 sq;
+
+	if (ca->ratio)
+		return ca->ratio;
+
+	if (!rtt_curr || rtt_max <= rtt_curr) {
+		ratio = ELEGANT_UNIT;
+	} else {
+		sq = DIV_ROUND_UP_ULL((u64)rtt_max << ELEGANT_UNIT_SQ_SHIFT,
+				      rtt_curr);
+		ratio = (u32)fast_sqrt(sq + 1);
+		ratio = clamp_t(u32, ratio, ELEGANT_UNIT, ELEGANT_RATIO_MAX);
+	}
+	ca->ratio = ratio;
+	return ratio;
+}
+
+static void elegant_cong_avoid(struct sock *sk, const struct rate_sample *rs)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	u32 acked = rs->acked_sacked;
 	u32 cwnd, wwf;
 
-	if (after(ack, ca->end_seq))
-		elegant_round(sk);
-
-	if (!tcp_is_cwnd_limited(sk))
+	if (!acked || !tcp_is_cwnd_limited(sk))
 		return;
 
 	if (tcp_in_slow_start(tp)) {
-		u32 base = elegant_min_rtt(ca);
+		u32 base = elegant_min_rtt(sk);
+		u32 bdp = elegant_bdp(sk);
 
-		if (base && elegant_avg_delay(ca) >= base)
-			tp->snd_ssthresh = min(tp->snd_ssthresh,
-					       elegant_bdp(sk));
+		if (base && bdp && elegant_avg_delay(sk) >= base)
+			tp->snd_ssthresh = min(tp->snd_ssthresh, bdp);
 		acked = tcp_slow_start(tp, acked);
 		if (!acked)
 			return;
 	}
 
 	cwnd = tcp_snd_cwnd(tp);
-	wwf = (fast_sqrt(cwnd) * ca->ratio) >> ELEGANT_SCALE;
-	if (ca->beta < GAIN_UNITY_BETA)
-		wwf = (u32)(((u64)wwf * ca->inv_beta) >> BETA_SHIFT);
+	wwf = ((u32)fast_sqrt(cwnd) * elegant_wwf_ratio(sk)) >> ELEGANT_SCALE;
 	wwf = max(wwf, 1U);
-
 	tcp_cong_avoid_ai(tp, cwnd, min_t(u64, (u64)wwf * acked, U32_MAX));
 }
 
-static u32 tcp_elegant_ssthresh(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	const struct elegant *ca = inet_csk_ca(sk);
-
-	return max(min(elegant_cut(ca, tcp_snd_cwnd(tp)), elegant_bdp(sk)), 2U);
-}
-
-static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
+static void elegant_save_cwnd(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
 
+	if (ca->prev_ca_state < TCP_CA_Recovery && !tcp_in_slow_start(tp))
+		ca->prior_cwnd = tcp_snd_cwnd(tp);
+	else
+		ca->prior_cwnd = max(ca->prior_cwnd, tcp_snd_cwnd(tp));
+}
+
+static bool elegant_recovery_cwnd(struct sock *sk, const struct rate_sample *rs)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct elegant *ca = inet_csk_ca(sk);
+	u8 state = inet_csk(sk)->icsk_ca_state;
+	u32 cwnd = tcp_snd_cwnd(tp);
+
+	if (rs->losses > 0)
+		cwnd = max_t(s32, (s32)cwnd - rs->losses, 1);
+
+	if (state == TCP_CA_Recovery && ca->prev_ca_state != TCP_CA_Recovery) {
+		ca->packet_conservation = 1;
+		ca->next_rtt_delivered = tp->delivered;
+		cwnd = tcp_packets_in_flight(tp) + rs->acked_sacked;
+	} else if (ca->prev_ca_state >= TCP_CA_Recovery &&
+		   state < TCP_CA_Recovery) {
+		cwnd = max(cwnd, min(ca->prior_cwnd, tp->snd_ssthresh));
+		ca->packet_conservation = 0;
+	}
+	ca->prev_ca_state = state;
+
+	if (ca->packet_conservation) {
+		cwnd = max(cwnd, tcp_packets_in_flight(tp) + rs->acked_sacked);
+		tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));
+		return true;
+	}
+	tcp_snd_cwnd_set(tp, min(max(cwnd, 2U), tp->snd_cwnd_clamp));
+	return false;
+}
+
+static u32 tcp_elegant_ssthresh(struct sock *sk)
+{
+	u32 cwnd = tcp_snd_cwnd(tcp_sk(sk));
+
+	elegant_save_cwnd(sk);
+	return max(cwnd - (cwnd >> ELEGANT_MD_SCALE), 2U);
+}
+
+static u32 tcp_elegant_undo_cwnd(struct sock *sk)
+{
+	struct elegant *ca = inet_csk_ca(sk);
+
+	return max(tcp_snd_cwnd(tcp_sk(sk)), ca->prior_cwnd);
+}
+
+static void elegant_round(struct sock *sk, const struct rate_sample *rs)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct elegant *ca = inet_csk_ca(sk);
+	u32 rtt_us;
+
+	if (rs->interval_us <= 0 ||
+	    before(rs->prior_delivered, ca->next_rtt_delivered))
+		return;
+
+	ca->next_rtt_delivered = tp->delivered;
+	ca->round++;
+	ca->ratio = 0;
+
+	if (rs->rtt_us <= 0)
+		goto filters;
+	if (rs->is_ack_delayed && !tcp_in_slow_start(tp))
+		goto filters;
+
+	rtt_us = max_t(u32, (u32)rs->rtt_us, 1U);
+	ca->rtt_curr = rtt_us;
+	ca->rtt_hi[1] = max(ca->rtt_hi[1], rtt_us);
+
+filters:
+	if (after(tcp_jiffies32, ca->filter_stamp + FILTER_RESET_JIFFIES) ||
+	    (ca->round >= FILTER_ROUND_THRESH && elegant_delay_stale(sk)))
+		elegant_advance_filters(sk);
+}
+
+static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *rs)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct elegant *ca = inet_csk_ca(sk);
+	u32 bw, cap;
+
+	bw = elegant_bw_sample(rs);
+	if (bw && (!rs->is_app_limited || bw > elegant_max_bw(sk)))
+		ca->bw_hi[1] = max(bw, ca->bw_hi[1]);
+
+	elegant_round(sk, rs);
+
+	if (!elegant_recovery_cwnd(sk, rs)) {
+		elegant_cong_avoid(sk, rs);
+		cap = elegant_cwnd_cap(sk);
+		if (cap && cap < tcp_snd_cwnd(tp))
+			tcp_snd_cwnd_set(tp, cap);
+	}
+
+	elegant_set_pacing_rate(sk);
+}
+
+static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
+{
+	struct elegant *ca = inet_csk_ca(sk);
+
 	if (new_state == TCP_CA_Loss) {
-		ca->beta = BETA_BASE;
-		ca->inv_beta = inv_beta_init;
-		ca->ratio = ELEGANT_UNIT;
-		ca->end_seq = tp->snd_nxt;
-		elegant_round_reset(ca);
+		ca->ratio = 0;
+		ca->prev_ca_state = TCP_CA_Loss;
+		ca->packet_conservation = 0;
 	}
 }
 
-static void tcp_elegant_init(struct sock *sk)
+static void elegant_init(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
 
 	memset(ca, 0, sizeof(*ca));
-	ca->round_rtt_min = UINT_MAX;
-	ca->beta = BETA_BASE;
-	ca->inv_beta = inv_beta_init;
-	ca->ratio = ELEGANT_UNIT;
-	ca->end_seq = tp->snd_nxt;
+	ca->next_rtt_delivered = tp->delivered;
+	ca->prior_cwnd = tcp_snd_cwnd(tp);
+	ca->prev_ca_state = TCP_CA_Open;
 	ca->filter_stamp = tcp_jiffies32;
+
+	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
 static struct tcp_congestion_ops tcp_elegant __read_mostly = {
-	.init		= tcp_elegant_init,
-	.ssthresh	= tcp_elegant_ssthresh,
-	.undo_cwnd	= tcp_reno_undo_cwnd,
-	.cong_avoid	= tcp_elegant_cong_avoid,
-	.pkts_acked	= tcp_elegant_acked,
-	.set_state	= tcp_elegant_set_state,
-	.owner		= THIS_MODULE,
 	.name		= "elegant",
+	.owner		= THIS_MODULE,
+	.init		= elegant_init,
+	.ssthresh	= tcp_elegant_ssthresh,
+	.undo_cwnd	= tcp_elegant_undo_cwnd,
+	.cong_control	= tcp_elegant_cong_control,
+	.set_state	= tcp_elegant_set_state,
 };
 
-static int __init tcp_elegant_register(void)
+static int __init elegant_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct elegant) > ICSK_CA_PRIV_SIZE);
+	if (cwnd_gain < ELEGANT_UNIT)
+		cwnd_gain = ELEGANT_UNIT;
+	if (cwnd_gain > 8 * ELEGANT_UNIT)
+		cwnd_gain = 8 * ELEGANT_UNIT;
 	return tcp_register_congestion_control(&tcp_elegant);
 }
 
-static void __exit tcp_elegant_unregister(void)
+static void __exit elegant_unregister(void)
 {
 	tcp_unregister_congestion_control(&tcp_elegant);
 }
 
-module_init(tcp_elegant_register);
-module_exit(tcp_elegant_unregister);
+module_init(elegant_register);
+module_exit(elegant_unregister);
 
 MODULE_AUTHOR("benhoklfai@gmail.com");
 MODULE_DESCRIPTION("Elegant TCP");
