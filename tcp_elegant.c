@@ -27,9 +27,9 @@
 #define FILTER_RESET_JIFFIES	(10 * HZ)
 #define FILTER_ROUND_THRESH	12
 
-static int cwnd_gain __read_mostly = 2 * ELEGANT_UNIT;
+static int cwnd_gain __read_mostly;
 module_param(cwnd_gain, int, 0644);
-MODULE_PARM_DESC(cwnd_gain, "Q3 inflight cap as a multiple of the BDP estimate");
+MODULE_PARM_DESC(cwnd_gain, "Q3 continuous inflight cap in BDP units, 0 disables");
 
 struct elegant {
 	u32 rtt_hi[2];
@@ -134,7 +134,7 @@ static u32 elegant_cwnd_cap(const struct sock *sk)
 	u32 bdp = elegant_bdp(sk);
 	u64 cap;
 
-	if (!bdp)
+	if (!cwnd_gain || !bdp)
 		return 0;
 	cap = ((u64)bdp * cwnd_gain) >> ELEGANT_SCALE;
 	return (u32)clamp_t(u64, cap, 2, tcp_sk(sk)->snd_cwnd_clamp);
@@ -272,9 +272,13 @@ static bool elegant_recovery_cwnd(struct sock *sk, const struct rate_sample *rs)
 static u32 tcp_elegant_ssthresh(struct sock *sk)
 {
 	u32 cwnd = tcp_snd_cwnd(tcp_sk(sk));
+	u32 cut = cwnd - (cwnd >> ELEGANT_MD_SCALE);
+	u32 bdp = elegant_bdp(sk);
 
 	elegant_save_cwnd(sk);
-	return max(cwnd - (cwnd >> ELEGANT_MD_SCALE), 2U);
+	if (bdp)
+		cut = min(cut, bdp);
+	return max(cut, 2U);
 }
 
 static u32 tcp_elegant_undo_cwnd(struct sock *sk)
@@ -373,10 +377,12 @@ static struct tcp_congestion_ops tcp_elegant __read_mostly = {
 static int __init elegant_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct elegant) > ICSK_CA_PRIV_SIZE);
-	if (cwnd_gain < ELEGANT_UNIT)
-		cwnd_gain = ELEGANT_UNIT;
-	if (cwnd_gain > 8 * ELEGANT_UNIT)
-		cwnd_gain = 8 * ELEGANT_UNIT;
+	if (cwnd_gain) {
+		if (cwnd_gain < ELEGANT_UNIT)
+			cwnd_gain = ELEGANT_UNIT;
+		if (cwnd_gain > 8 * ELEGANT_UNIT)
+			cwnd_gain = 8 * ELEGANT_UNIT;
+	}
 	return tcp_register_congestion_control(&tcp_elegant);
 }
 
