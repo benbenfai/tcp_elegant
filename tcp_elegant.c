@@ -394,5 +394,6 @@ static void __exit elegant_unregister(void)
 module_init(elegant_register);
 module_exit(elegant_unregister);
 
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("benhoklfai@gmail.com");
 MODULE_DESCRIPTION("Elegant TCP");
