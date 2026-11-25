@@ -183,6 +183,14 @@ static void elegant_cong_avoid(struct sock *sk, const struct rate_sample *rs)
 			return;
 	}
 
+	{
+		u32 base = elegant_min_rtt(sk);
+		u32 da = elegant_avg_delay(sk);
+
+		if (base && da > (base >> 3))
+			return;
+	}
+
 	cwnd = tcp_snd_cwnd(tp);
 	wwf = ((u32)fast_sqrt(cwnd) * elegant_wwf_ratio(sk)) >> ELEGANT_SCALE;
 	wwf = max(wwf, 1U);
@@ -237,10 +245,6 @@ static u32 tcp_elegant_ssthresh(struct sock *sk)
 	u32 bdp = elegant_bdp(sk);
 
 	elegant_save_cwnd(sk);
-	/* WHY: as a ceiling this conceded the pipe on every loss to a
-	 * max_bw estimate that undershoots right after a filter advance.
-	 * As a floor, backoff never drops below the measured pipe.
-	 */
 	if (bdp)
 		cut = max(cut, min(bdp, cwnd));
 	return max(cut, 2U);
@@ -253,11 +257,6 @@ static u32 tcp_elegant_undo_cwnd(struct sock *sk)
 	return max(tcp_snd_cwnd(tcp_sk(sk)), ca->prior_cwnd);
 }
 
-/* Leave startup at the measured pipe, but only after two consecutive
- * rounds of delay signal: srtt lags about one RTT and max_bw lags about
- * one round while cwnd is still doubling, and both errors shrink bdp,
- * so a single signalling round exits at roughly half the pipe.
- */
 static void elegant_slow_start_exit(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -292,14 +291,24 @@ static void elegant_round(struct sock *sk, const struct rate_sample *rs)
 	ca->next_rtt_delivered = tp->delivered;
 	ca->round++;
 	ca->ratio = 0;
+	ca->packet_conservation = 0;
 
-	/* WHY: the boundary ACK alone used to set rtt_curr, so one queued
-	 * sample floored ratio at ELEGANT_UNIT for the whole next round.
-	 * The round minimum is the sample that saw the short queue.
-	 */
 	if (ca->rtt_round_min) {
 		ca->rtt_curr = ca->rtt_round_min;
 		ca->rtt_round_min = 0;
+	}
+
+	{
+		u32 base = elegant_min_rtt(sk);
+		u32 da = elegant_avg_delay(sk);
+		u32 cwnd = tcp_snd_cwnd(tp);
+
+		if (base && da > (base >> 3) && cwnd > 4 &&
+		    !tcp_in_slow_start(tp)) {
+			u32 step = 1U;
+
+			tcp_snd_cwnd_set(tp, max(cwnd - step, 4U));
+		}
 	}
 
 	elegant_slow_start_exit(sk);
