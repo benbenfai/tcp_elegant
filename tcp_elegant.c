@@ -221,6 +221,7 @@ static bool elegant_recovery_cwnd(struct sock *sk, const struct rate_sample *rs)
 	if (state == TCP_CA_Recovery && ca->prev_ca_state != TCP_CA_Recovery) {
 		ca->packet_conservation = 1;
 		ca->next_rtt_delivered = tp->delivered;
+		elegant_advance_filters(sk);
 		cwnd = tcp_packets_in_flight(tp) + rs->acked_sacked;
 	} else if (ca->prev_ca_state >= TCP_CA_Recovery &&
 		   state < TCP_CA_Recovery) {
