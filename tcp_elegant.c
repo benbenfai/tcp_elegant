@@ -21,8 +21,8 @@
 #define BW_SCALE	24
 #define BW_UNIT		(1 << BW_SCALE)
 
-#define FILTER_RESET_JIFFIES	(10 * HZ)
-#define FILTER_ROUND_THRESH	12
+#define FILTER_RESET_JIFFIES	(5 * HZ)
+#define FILTER_ROUND_THRESH	6
 
 struct elegant {
 	u32 rtt_hi[2];
