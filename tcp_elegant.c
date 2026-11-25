@@ -24,10 +24,6 @@
 #define FILTER_RESET_JIFFIES	(10 * HZ)
 #define FILTER_ROUND_THRESH	12
 
-static int cwnd_gain __read_mostly;
-module_param(cwnd_gain, int, 0644);
-MODULE_PARM_DESC(cwnd_gain, "Q3 continuous inflight cap in BDP units, 0 disables");
-
 struct elegant {
 	u32 rtt_hi[2];
 	u32 bw_hi[2];
@@ -126,17 +122,6 @@ static u32 elegant_bdp(const struct sock *sk)
 		return 0;
 	bdp = ((u64)bw * rtt) >> BW_SCALE;
 	return (u32)clamp_t(u64, bdp, 2, U32_MAX);
-}
-
-static u32 elegant_cwnd_cap(const struct sock *sk)
-{
-	u32 bdp = elegant_bdp(sk);
-	u64 cap;
-
-	if (!cwnd_gain || !bdp)
-		return 0;
-	cap = ((u64)bdp * cwnd_gain) >> ELEGANT_SCALE;
-	return (u32)clamp_t(u64, cap, 2, tcp_sk(sk)->snd_cwnd_clamp);
 }
 
 static u64 fast_sqrt(u64 x)
@@ -328,7 +313,7 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
-	u32 bw, cap;
+	u32 bw;
 
 	bw = elegant_bw_sample(rs);
 	if (bw && (!rs->is_app_limited || bw > elegant_max_bw(sk)))
@@ -345,12 +330,8 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 
 	elegant_round(sk, rs);
 
-	if (!elegant_recovery_cwnd(sk, rs)) {
+	if (!elegant_recovery_cwnd(sk, rs))
 		elegant_cong_avoid(sk, rs);
-		cap = elegant_cwnd_cap(sk);
-		if (cap && cap < tcp_snd_cwnd(tp))
-			tcp_snd_cwnd_set(tp, cap);
-	}
 }
 
 static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
@@ -403,5 +384,4 @@ module_init(elegant_register);
 module_exit(elegant_unregister);
 
 MODULE_AUTHOR("benhoklfai@gmail.com");
-MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Elegant TCP");
