@@ -21,9 +21,6 @@
 #define BW_SCALE	24
 #define BW_UNIT		(1 << BW_SCALE)
 
-#define PACING_SS_RATIO	200U
-#define PACING_CA_RATIO	120U
-
 #define FILTER_RESET_JIFFIES	(10 * HZ)
 #define FILTER_ROUND_THRESH	12
 
@@ -35,13 +32,15 @@ struct elegant {
 	u32 rtt_hi[2];
 	u32 bw_hi[2];
 	u32 rtt_curr;
+	u32 rtt_round_min;
 	u32 ratio;
 	u32 round;
 	u32 next_rtt_delivered;
 	u32 prior_cwnd;
 	u32 filter_stamp;
 	u8  prev_ca_state:3,
-	    packet_conservation:1;
+	    packet_conservation:1,
+	    ss_delay_rounds:2;
 };
 
 static u32 elegant_min_rtt(const struct sock *sk)
@@ -140,24 +139,6 @@ static u32 elegant_cwnd_cap(const struct sock *sk)
 	return (u32)clamp_t(u64, cap, 2, tcp_sk(sk)->snd_cwnd_clamp);
 }
 
-static void elegant_set_pacing_rate(struct sock *sk)
-{
-	const struct tcp_sock *tp = tcp_sk(sk);
-	u64 rate;
-
-	if (unlikely(!tp->srtt_us || !tp->mss_cache))
-		return;
-
-	rate = (u64)tp->mss_cache * ((USEC_PER_SEC / 100) << 3);
-	rate *= tcp_snd_cwnd(tp) < tp->snd_ssthresh / 2 ?
-		PACING_SS_RATIO : PACING_CA_RATIO;
-	rate *= max(tcp_snd_cwnd(tp), tp->packets_out);
-	do_div(rate, tp->srtt_us);
-
-	WRITE_ONCE(sk->sk_pacing_rate,
-		   min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate)));
-}
-
 static u64 fast_sqrt(u64 x)
 {
 	u64 result = 0;
@@ -212,11 +193,6 @@ static void elegant_cong_avoid(struct sock *sk, const struct rate_sample *rs)
 		return;
 
 	if (tcp_in_slow_start(tp)) {
-		u32 base = elegant_min_rtt(sk);
-		u32 bdp = elegant_bdp(sk);
-
-		if (base && bdp && elegant_avg_delay(sk) >= base)
-			tp->snd_ssthresh = min(tp->snd_ssthresh, bdp);
 		acked = tcp_slow_start(tp, acked);
 		if (!acked)
 			return;
@@ -276,8 +252,12 @@ static u32 tcp_elegant_ssthresh(struct sock *sk)
 	u32 bdp = elegant_bdp(sk);
 
 	elegant_save_cwnd(sk);
+	/* WHY: as a ceiling this conceded the pipe on every loss to a
+	 * max_bw estimate that undershoots right after a filter advance.
+	 * As a floor, backoff never drops below the measured pipe.
+	 */
 	if (bdp)
-		cut = min(cut, bdp);
+		cut = max(cut, min(bdp, cwnd));
 	return max(cut, 2U);
 }
 
@@ -288,11 +268,37 @@ static u32 tcp_elegant_undo_cwnd(struct sock *sk)
 	return max(tcp_snd_cwnd(tcp_sk(sk)), ca->prior_cwnd);
 }
 
+/* Leave startup at the measured pipe, but only after two consecutive
+ * rounds of delay signal: srtt lags about one RTT and max_bw lags about
+ * one round while cwnd is still doubling, and both errors shrink bdp,
+ * so a single signalling round exits at roughly half the pipe.
+ */
+static void elegant_slow_start_exit(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct elegant *ca = inet_csk_ca(sk);
+	u32 cwnd = tcp_snd_cwnd(tp);
+	u32 base = elegant_min_rtt(sk);
+	u32 bdp = elegant_bdp(sk);
+
+	if (!tcp_in_slow_start(tp) || !base || !bdp ||
+	    elegant_avg_delay(sk) < base) {
+		ca->ss_delay_rounds = 0;
+		return;
+	}
+	if (ca->ss_delay_rounds < 2)
+		ca->ss_delay_rounds++;
+	if (ca->ss_delay_rounds < 2)
+		return;
+
+	tp->snd_ssthresh = min(tp->snd_ssthresh,
+			       max(bdp, cwnd - (cwnd >> 2)));
+}
+
 static void elegant_round(struct sock *sk, const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct elegant *ca = inet_csk_ca(sk);
-	u32 rtt_us;
 
 	if (rs->interval_us <= 0 ||
 	    before(rs->prior_delivered, ca->next_rtt_delivered))
@@ -302,16 +308,17 @@ static void elegant_round(struct sock *sk, const struct rate_sample *rs)
 	ca->round++;
 	ca->ratio = 0;
 
-	if (rs->rtt_us <= 0)
-		goto filters;
-	if (rs->is_ack_delayed && !tcp_in_slow_start(tp))
-		goto filters;
+	/* WHY: the boundary ACK alone used to set rtt_curr, so one queued
+	 * sample floored ratio at ELEGANT_UNIT for the whole next round.
+	 * The round minimum is the sample that saw the short queue.
+	 */
+	if (ca->rtt_round_min) {
+		ca->rtt_curr = ca->rtt_round_min;
+		ca->rtt_round_min = 0;
+	}
 
-	rtt_us = max_t(u32, (u32)rs->rtt_us, 1U);
-	ca->rtt_curr = rtt_us;
-	ca->rtt_hi[1] = max(ca->rtt_hi[1], rtt_us);
+	elegant_slow_start_exit(sk);
 
-filters:
 	if (after(tcp_jiffies32, ca->filter_stamp + FILTER_RESET_JIFFIES) ||
 	    (ca->round >= FILTER_ROUND_THRESH && elegant_delay_stale(sk)))
 		elegant_advance_filters(sk);
@@ -327,18 +334,23 @@ static void tcp_elegant_cong_control(struct sock *sk, const struct rate_sample *
 	if (bw && (!rs->is_app_limited || bw > elegant_max_bw(sk)))
 		ca->bw_hi[1] = max(bw, ca->bw_hi[1]);
 
+	if (rs->rtt_us > 0 &&
+	    (!rs->is_ack_delayed || tcp_in_slow_start(tp))) {
+		u32 rtt_us = max_t(u32, (u32)rs->rtt_us, 1U);
+
+		ca->rtt_round_min = ca->rtt_round_min ?
+			min(ca->rtt_round_min, rtt_us) : rtt_us;
+		ca->rtt_hi[1] = max(ca->rtt_hi[1], rtt_us);
+	}
+
 	elegant_round(sk, rs);
 
 	if (!elegant_recovery_cwnd(sk, rs)) {
 		elegant_cong_avoid(sk, rs);
-		if (tcp_is_cwnd_limited(sk)) {
-			cap = elegant_cwnd_cap(sk);
-			if (cap && cap < tcp_snd_cwnd(tp))
-				tcp_snd_cwnd_set(tp, cap);
-		}
+		cap = elegant_cwnd_cap(sk);
+		if (cap && cap < tcp_snd_cwnd(tp))
+			tcp_snd_cwnd_set(tp, cap);
 	}
-
-	elegant_set_pacing_rate(sk);
 }
 
 static void tcp_elegant_set_state(struct sock *sk, u8 new_state)
@@ -379,12 +391,6 @@ static struct tcp_congestion_ops tcp_elegant __read_mostly = {
 static int __init elegant_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct elegant) > ICSK_CA_PRIV_SIZE);
-	if (cwnd_gain) {
-		if (cwnd_gain < ELEGANT_UNIT)
-			cwnd_gain = ELEGANT_UNIT;
-		if (cwnd_gain > 8 * ELEGANT_UNIT)
-			cwnd_gain = 8 * ELEGANT_UNIT;
-	}
 	return tcp_register_congestion_control(&tcp_elegant);
 }
 
@@ -397,4 +403,5 @@ module_init(elegant_register);
 module_exit(elegant_unregister);
 
 MODULE_AUTHOR("benhoklfai@gmail.com");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Elegant TCP");
