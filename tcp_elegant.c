@@ -175,6 +175,25 @@ static u32 elegant_wwf_ratio(struct sock *sk)
 	ca->ratio = ratio;
 	return ratio;
 }
+/* The knee, tested on the ACK that carries it, not a round later.
+ * elegant_round() can only read ca->rtt_curr, which is the minimum over a
+ * window straddling two round boundaries. While the window ramps, that
+ * minimum is always the pre-queue round, so the boundary sees the knee one
+ * full doubling late and the overshoot is already sent.
+ */
+static void elegant_ss_knee(struct sock *sk, const struct rate_sample *rs)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	u32 base = elegant_min_rtt(sk);
+	if (!tcp_in_slow_start(tp) || !base || rs->rtt_us <= 0)
+		return;
+	if ((u32)rs->rtt_us <= base + (base >> 3))
+		return;
+	/* Full pipe. Hand the window to the WWF law where it stands: the
+	 * delay gate owns it from here, so nothing is cut here.
+	 */
+	tp->snd_ssthresh = tcp_snd_cwnd(tp);
+}
 static void elegant_cong_avoid(struct sock *sk, const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -182,6 +201,7 @@ static void elegant_cong_avoid(struct sock *sk, const struct rate_sample *rs)
 	u32 cwnd, wwf;
 	if (!acked || !tcp_is_cwnd_limited(sk))
 		return;
+	elegant_ss_knee(sk, rs);
 	if (tcp_in_slow_start(tp)) {
 		acked = tcp_slow_start(tp, acked);
 		if (!acked)
