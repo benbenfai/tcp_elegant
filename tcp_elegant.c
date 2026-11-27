@@ -33,8 +33,7 @@ struct elegant {
 	u32 prior_cwnd;
 	u32 filter_stamp;
 	u8  prev_ca_state:3,
-	    packet_conservation:1,
-	    ss_delay_rounds:2;
+	    packet_conservation:3;
 };
 static u32 elegant_min_rtt(const struct sock *sk)
 {
@@ -282,17 +281,11 @@ static void elegant_slow_start_exit(struct sock *sk)
 	u32 bdp = elegant_bdp(sk);
 	if (!tcp_in_slow_start(tp) || !base || !bdp ||
 	    elegant_avg_delay(sk) < base) {
-		ca->ss_delay_rounds = 0;
 		return;
 	}
-	if (ca->ss_delay_rounds < 2)
-		ca->ss_delay_rounds++;
-	if (ca->ss_delay_rounds < 2)
-		return;
 	/* Full pipe: threshold is the knee, not 3/4 of the inflated window. */
 	tp->snd_ssthresh = min_t(u32, tp->snd_ssthresh,
 				 elegant_ssthresh_target(sk));
-	ca->ss_delay_rounds = 0;
 	elegant_apply_ssthresh(sk);
 }
 static void elegant_round(struct sock *sk, const struct rate_sample *rs)
